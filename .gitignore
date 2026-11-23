@@ -1,0 +1,18 @@
+# Maven build output
+target/
+
+# Generated analysis output
+out/
+
+# IDE
+.idea/workspace.xml
+.idea/shelf/
+*.iml
+*.iws
+*.ipr
+
+# Renderer pages
+.answer-me/
+
+# OS
+.DS_Store

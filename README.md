@@ -1,128 +1,240 @@
-# -voronoi-
-龙龙粉丝后援团专属
+# -voronoi- 基站覆盖区与人口分布分析
 
-#2.29重新阅读论文，找到https://blog.csdn.net/weixin_42943114/article/details/82262122?depth_1-utm_source=distribute.pc_relevant.none-task&utm_source=distribute.pc_relevant.none-task
-作为索引了解代码思路
+用基站坐标构建 Voronoi 覆盖区，再把手机信令记录按坐标落到对应覆盖区，输出按时段统计人口分布的 GeoJSON，可直接用 Leaflet / Mapbox / QGIS 渲染。
 
-#3.1 
-配置idea环境，安装了maven、mybatis和mysql8.0.1
+> 项目源自 **2020 年第十一届中国大学生服务外包创新创业大赛 A06【交通时空大数据分析挖掘系统】【东软】**，实现其中「人群密度（热力）分析」一项。官方数据见 [data/a06/SOURCE.md](data/a06/SOURCE.md)，原始开发日志见 [docs/DEVLOG.md](docs/DEVLOG.md)，缺陷修复清单见 [docs/FIXES.md](docs/FIXES.md)。
 
-由于maven不能编译maven项目下src路径中的xml文件，以及mysql8.0.1换了字符编码，配置了近一天环境 
- 
-进展：  
-1、用sql语言内连接清洗后的原始数据和基站静态数据，制作含有（time、imsi、longitude、latitude）四个字段的一张表用于时间切片  
-2、完成初始的pojo创建，准备好数据库所需的所有表-类映射以及基础数据类的创建  
-3、完成mybatis与mysql的连接，完成读取数据指令
-（注：原有的cell_id过大，被舍弃，在数据库读取的过程中所有基站被定义新id，方便程序编写）
-      
-#3.2  
-进展：  
-1、重写Point的compare方法，完成所有点，经度为主序，纬度为从序的排列，为三角剖分做准备  
-2、完成超级三角形的构建  
+## 处理流程
 
-#3.3  
-进展：  
-1、完成基础的三角剖分  
-2、简单跑了一下算法，改了两个bug  
-3、发现算法复杂度为O(n^2)，但是复杂度改不了，只能在计算中及时释放不需要的数据  
-4、对最复杂的部分，每次都要开辟大量空间，执行重复的计算，所以写了多线程
+```
+基站坐标 ──▶ 去重排序 ──▶ Delaunay 三角剖分 ──▶ 邻接关系 ──▶ 半平面裁剪 ──▶ Voronoi 覆盖区
+                                                                              │
+信令记录 ──▶ 坐标 + 小时 ──▶ 多边形包含判断（射线法）──▶ 分时段人口 ──▶ GeoJSON
 
-#3.4
-写了一早上，发现还是不行，算的太慢了，决定换一种算法  
+```
 
-对昨天进行纠正，更新算法最复杂的函数为buffer去重.  
-调整算法后，十几秒就算完了2.8K个点，但是还不能验证正确性  
+| 阶段 | 类 | 说明 |
+| --- | --- | --- |
+| 读数据 | `io.*Source` | 支持 MySQL（MyBatis）和 CSV 两种来源 |
+| 三角剖分 | `algorithm.DelaunayTriangulator` | Bowyer-Watson 增量法，外接圆用归一化行列式判定 |
+| 覆盖区 | `algorithm.VoronoiBuilder` | 对每个基站，用 Delaunay 邻接的半平面求交 |
+| 人口归属 | `algorithm.PopulationAnalyzer` | 多边形包含 + 最近基站兜底 |
+| 导出 | `io.GeoJsonExporter` | RFC 7946 GeoJSON，外环逆时针闭合 |
 
-在c#文件中添加了一个显示三角形总数的代码，发现对n个点，最终构成2n+1个三角形，而我的程序对2793个点构成72000+个三角形  
+## 快速开始
 
-发现问题根源：基站点集中有重复的点，这些点在算法中无法判断，导致缓存数组中数据量特别多，还不能通过条件remove掉  
-解决方案：在读入后对sites进行去重，再写入points，发现点集个数降为2696，所以有97个重复点  
-神奇的事情出现了，三角形数据量不减反增到了78389个？？？
+要求 JDK 8+、Maven 3.6+。
 
-发现问题：有些点的buffer为0  
-很清楚地可以看出，这些必定是longitude相同，latitude不同的点  
-思考后发现，这并没有什么关系，只是在圆外而已，不影响程序 
+```bash
+# 构建（含 49 个单元测试）
+mvn clean package
 
-发现问题：有些时候，buffer去重后，减去了奇数个。而两圆相交，必定只有一条公共弦，buffer中一去去两个，不可能有奇数条  
-难道会有三圆相交，出现一条公共弦的情况？  
-在进一步测试中发现问题，在有重复的list中有n条，出现了去重后删除数量小于2n的情况，且非常普遍  
-发现问题所在：边的equals条件重写后，当两点相同时返回true，但是，删除时，没有顺序  
-解决方案：检查重复时，遇到相同的edge，同时将两个edge加入重复list
+# 用自带样例数据跑一遍，不需要数据库
+java -jar target/voronoi-analysis.jar \
+  --stations=csv:samples/stations.csv \
+  --users=csv:samples/users.csv \
+  --out=out/cells.geojson
+```
 
-最终解决：发现基站数据中重复的点并没有根本去重完全，因为数据库中的数据是乱序的，我是用倒序遍历删除重复点的  
-修改bug后，基站数量确定为1519，三角形数为3022，估计还有17个三角形还没有进行凸边补全  
-晚上再做（15:37），去吃中饭了
+样例输出：
 
-#3.5
-第一次完成凸边修饰后，三角形数量增加了42个至3064，远远超过了预期，需要检查一下  
-DEBUG发现大量重复  
-发现去除函数有问题  
-修复去重函数，现在已经可以正常去重，三角形数量降至3050，仍有11个超过预期  
+```
+Loaded 25 stations and 600 user records
+Triangulation : 32 triangles, 16 boundary points
+Voronoi cells : 25 (duplicates skipped: 0)
+Population    : users=600, inside=464, nearest=136, unassigned=0, unknownHour=0
+Total area    : 285.382 km2
+Output        : .../out/cells.geojson (185 ms)
+```
 
-手动数，发现21个需要去除的三角形
+## 真实赛题数据（2020 服创大赛 A06）
 
-发现少写了一个break，现数量降至3029，比预期少了10个，考虑到算法的不一致性，我认为暂时没有问题了  
+本项目的来源是 **2020 年第十一届中国大学生服务外包创新创业大赛 A 类命题 A06【交通时空大数据分析挖掘系统】【东软】**。赛题原文写明「东软提供原始数据（脱敏信令数据）和各模块所需的静态数据」，官方附件至今仍可下载。
 
-计算了运行时间，平均1.8s左右，我觉得行
+仓库已经带上这份数据，开箱可用：
 
-wow，发现一个大问题：基站经纬度张表，不是表现的基站的经纬度，是人所在扇区的经纬度  
-那么，基站的数量将大大减少  
-我表做完了，基站好像只剩不到80个了，明天早上重新设计jdbc  
-立个flag，100ms能跑完
+```bash
+java -jar target/voronoi-analysis.jar \
+  --stations=csv:data/a06/stations.csv \
+  --users=csv:data/a06/users.csv \
+  --out=out/a06-cells.geojson
+```
 
-#3.6
-今天重建了数据库表，把74个基站点做了一张表  
-结束程序后，有141个三角形，5条边缘边，比预想的少  
-我直接看了地图数据，我认为边缘应该有9个  
-结合地图，发现凹点判断条件有问题，把凸点全删了 
-找到bug，赋值的时候ctrl+D了，条件没改  
-改好了，9个点，挺好的，就是删错点了？？？  
-又是复制的时候，条件没改。。。  
-嗯。现在9条边缘边，210条边，137个三角形，用时1.2s，完美
+| 指标 | 结果 |
+| --- | --- |
+| 基站（按坐标去重后） | 1519 |
+| 三角网 | 3023 个三角形，13 个边界点 |
+| 覆盖区 | 1519 个 |
+| 信令 | 9849 条，全部落入覆盖区 |
+| 总耗时 | 446 ms |
 
-#3.7
-写了绘制维诺图的部分，发现，构建完后的边数为2277，远超预期  
-检查代码，发现边去重和交线判断完全没有发挥作用，准备重写  
-第一个bug，遍历构造的时候没把自身去掉，线段变点了，根本无法通过相交删掉  
-第二个bug，我真的不知道为什么，在前一个遍历中，输出的边集与实际的边集顺序不一样的  
-诶，我知道了，是我重写edge的toString的时候，打错了个参数，导致我人眼debug的时候，误判了
-第三个bug，不出意料的，线段交叉判断又出问题了
+`data/a06/raw/` 是官方原始文件，`data/a06/stations.csv` 与 `users.csv` 由清洗脚本生成：
 
-好了好了搞定了，下一步，边缘边的覆盖区
+```bash
+python3 tools/import_a06.py
+```
 
-写完维诺图了，用时1203ms，嘿嘿
+脚本实现了 `数据说明.docx` 里的 7 条清洗规则（去特殊字符、去空字段、时间戳转换、只留 2018-10-03、关联坐标、按人按时间排序）。细节见 [data/a06/SOURCE.md](data/a06/SOURCE.md)。
 
-#3.8
-今天打算放假的，后来不写点东西好难受，就继续了  
-对于多边形面积的计算，本质上是要转化为三角形面积计算的，那么最大的问题就是如何转化为三角形  
-我现在有两分钟思路：1、利用之前写好的三角剖分 2、对多边形的顶点进行排序，取一点分别连接非邻边  
-诶，后一种，好像排序都不用，我有边缘边列表的，排除邻边就好了，哦吼  
-做完出了点问题，有9个基站没有面积，一定是边缘点出问题了  
-追溯回去，是边缘点的覆盖区计算有问题  
-再次追溯，边缘边中垂线与图形边界交点，只是一个空壳  
-嗯，ctrl+D真是我最大的敌人，一个坑栽了4次了  
-点是有了，交点还有点问题，太远了  
-找到问题了，一元二次方程的通项公式在计算的时候，对常数c没有加负号
+## 命令行参数
 
-面积都太小了呀，还要把经纬度转化为千米吧  
-又有几种方案：1、高斯投影  2、球面积积分  3、最简单的转换，缺点是不是特别特别准确  
-最后还是采用了最简单的方法，因为一个沈阳市的经纬度跨度不大，用大致的经纬度转换就可以了，但是给后面给全国的推广留下一点隐患（要改再改，理直气壮.jpg）
+| 参数 | 说明 |
+| --- | --- |
+| `--stations=<db\|csv:path>` | 基站来源，`db` 表示走数据库 |
+| `--users=<db\|csv:path>` | 信令来源 |
+| `--out=<path>` | 输出文件，默认 `out/cells.geojson` |
+| `--clip-margin=<0..1>` | 覆盖区裁剪窗口相对基站外接框的外扩比例，默认 `0.05` |
+| `--help` | 打印帮助 |
 
-在设计数据库了，还在学mybatis一对多和批量insert  
-发现了一个拼写错误，我竟然写错一个单词56次？？？边缘Broder！ 
+不带参数时，按 `application.properties` 里的 `stations.source` / `users.source` 读取。
 
-跟前端聊了一下需求，要把覆盖区的边缘点按顺时针或逆时针排个序，然后转化为json给前端  
-在做边缘点排序的时候，截取了已经写好的一个函数的一部分，发现出了大问题，少了一行插入，但是，神奇的是，加不加对程序运行结果没有影响
+## 配置
 
-#3.10
-终于结束python的部分了，重新设计了一下后面的步骤。明天继续
+`src/main/resources/application.properties`：
 
-#3.11
-今天本来想通过判断点在覆盖区中的面积，判断是否在覆盖区中，但是直接用==只能匹配到1700+，那就不行了  
-新的方法是  射线法  
-但是我仔细看了一下面积，其实差距在小数点后16位才不一样，我觉得做个遍历简单一点，不过要做个判断  
-不用射线法了，面积法挺好的，我的分区和原始数据中的分区匹配度为100%，太强了吧（那不是分区没啥用？？？）  
-用还是有用的（自我安慰一下），做密度的时候用得到（这么点数据根本做不了密度吧！！！）
+```properties
+db.url=jdbc:mysql://localhost:3306/yy?serverTimezone=Asia/Shanghai&useSSL=false
+db.username=root
+db.password=
+stations.source=db
+users.source=db
+output=out/cells.geojson
+clip.margin=0.05
+```
 
-#3.15
-一直在学习。。。今天完工了，要开始做文档了
+数据库密码不要写进文件，用环境变量覆盖：
+
+```bash
+export VORONOI_DB_PASSWORD='...'
+```
+
+可覆盖的变量：`VORONOI_DB_URL`、`VORONOI_DB_USERNAME`、`VORONOI_DB_PASSWORD`、`VORONOI_DB_DRIVER`。
+
+### 数据库表结构
+
+```sql
+-- 基站表
+CREATE TABLE jizhandata (
+  lac       INT PRIMARY KEY,     -- 基站编号
+  longitude DOUBLE NOT NULL,
+  latitude  DOUBLE NOT NULL
+);
+
+-- 信令表
+CREATE TABLE dempsey (
+  time      BIGINT NOT NULL,     -- yyyyMMddHHmmss、epoch 毫秒或 0-23 的小时
+  imsi      BIGINT NOT NULL,
+  longitude DOUBLE NOT NULL,
+  latitude  DOUBLE NOT NULL,
+  lac       INT
+);
+```
+
+## CSV 格式
+
+`stations.csv`：
+
+```csv
+id,name,longitude,latitude
+1,SY-001,123.30000,41.75000
+```
+
+`name` 列可以省略，写成 `id,longitude,latitude`。表头、空行、`#` 注释都会被跳过。
+
+`users.csv`：
+
+```csv
+time,imsi,longitude,latitude,lac
+20200301192830,460000000000001,123.429374,41.928262,20
+```
+
+## 输出
+
+GeoJSON `FeatureCollection`，每个覆盖区一个 `Feature`：
+
+```json
+{
+  "type": "Feature",
+  "geometry": { "type": "Polygon", "coordinates": [[[123.3, 41.75], "...", [123.3, 41.75]]] },
+  "properties": {
+    "stationId": 1,
+    "stationName": "SY-001",
+    "areaKm2": 7.231341,
+    "totalUsers": 32,
+    "hourlyUsers": [0, 1, 0, "... 共 24 个"],
+    "hourlyCapacity": [0, 2, 0, "... 共 24 个"],
+    "hourlyChangeRate": [0.5, -1.0, "... 共 24 个"]
+  }
+}
+```
+
+- `areaKm2`：覆盖区面积，按覆盖区平均纬度做局部等距投影后计算。
+- `hourlyUsers[24]`：该小时落入本覆盖区的信令条数。
+- `hourlyCapacity[24]`：论文给出的上界估计 `ceil((1.1 + 1/ln(n)) * n) + 5`，`n=0` 取 0，`n=1` 取 2。
+- `hourlyChangeRate[24]`：相对下一小时的变化率，`(next - current) / current`。
+
+## 代码结构
+
+```
+src/main/java/org/example/voronoi/
+├── Main.java                       命令行入口
+├── Pipeline.java                   端到端流程（不依赖 IO，便于测试）
+├── algorithm/
+│   ├── DelaunayTriangulator.java   Bowyer-Watson 三角剖分
+│   ├── Triangulation.java          三角网结果 + 邻接表
+│   ├── VoronoiBuilder.java         半平面裁剪生成覆盖区
+│   └── PopulationAnalyzer.java     人口归属与分时段统计
+├── geometry/
+│   ├── Coordinate.java             经纬度值对象（可作 HashMap 键）
+│   ├── Edge.java                   无向边（equals/hashCode 成对实现）
+│   ├── Triangle.java               逆时针三角形 + 外接圆判定
+│   └── Geometry.java               叉积、面积、包含、裁剪、凸包
+├── model/                          Station / UserRecord / VoronoiCell
+├── io/                             CSV、JDBC、GeoJSON 导出、来源工厂
+├── db/                             MyBatis mapper
+└── config/AppConfig.java           properties + 环境变量
+src/main/resources/application.properties
+src/test/java/                    49 个单元测试
+samples/                          自造的小样例（25 基站 + 600 信令）
+data/a06/                         官方 A06 赛题数据（含 raw/ 与清洗结果）
+tools/import_a06.py               官方数据清洗与格式转换脚本
+```
+
+## 算法要点
+
+**三角剖分**。逐点插入：先用一个覆盖全部输入点的超级三角形起手；对每个点，删掉外接圆包含它的三角形，把「只被一个被删三角形使用」的边与新点连成新三角形；最后删掉带超级顶点的三角形。外接圆判据用相对归一化行列式，避免近共线三角形半径爆炸。
+
+**覆盖区**。基站的 Voronoi 元胞 = 到该基站比到任何其他基站都近的点集 = 每个 Delaunay 邻接对应一个半平面，求交即可。初始多边形是裁剪窗口矩形，逐个半平面做 Sutherland-Hodgman 裁剪，结果天然是逆时针凸多边形。边界基站的元胞会被窗口截断，这正是「预测覆盖区」想要的效果。
+
+**面积**。经纬度不是等距坐标，直接乘常数会偏。这里先取覆盖区平均纬度，用局部等距投影把经纬度换成米，再用鞋带公式算面积。城市尺度下与球面公式误差小于 0.2%（有测试守着）。
+
+## 测试
+
+```bash
+mvn test
+```
+
+49 个测试，覆盖：
+
+| 测试类 | 验证内容 |
+| --- | --- |
+| `GeometryTest` | 叉积定向、面积、点在多边形内、半平面裁剪、垂直/共线线段相交、凸包 |
+| `DelaunayTriangulatorTest` | 三角形数满足 `2n-2-h`、空外接圆性质、无顶点丢失、重复点去重、共线输入不产生 NaN |
+| `VoronoiBuilderTest` | 覆盖区面积之和等于裁剪窗口、每个基站在自己的元胞内、元胞为逆时针凸多边形、共线基站仍能铺满 |
+| `PopulationAnalyzerTest` | 包含判断、最近兜底、分时段计数、变化率不是整除、空时段不产生 NaN |
+| `CsvSourceTest` | 表头/注释/BOM/列数兼容、错误行号提示 |
+| `PipelineTest` | 端到端流程 + GeoJSON 结构与闭合性 |
+| `RealDataRegressionTest` | 官方 A06 数据：1519 基站、3023 三角形、9849 信令全部落区 |
+| `AppConfigTest` | 配置默认值、MyBatis mapper 注册 |
+
+## 已知限制
+
+- Voronoi 只考虑几何距离，没有天线方向角、发射功率、地形遮挡。真实覆盖区需要无线传播模型。
+- 裁剪窗口默认只在基站外接框外扩 5%，落在窗口外的信令会走「最近基站」兜底，并在日志中单独计数。A06 数据里有少量远郊基站，会把窗口拉到 2.6 万 km²。
+- 三角剖分是 `O(n²)` 的朴素实现。样例 25 个点 185 ms；1519 个基站 446 ms；上万基站需要换分治或扫描线版本。
+- `hourlyCapacity` 是论文经验公式，不是真实人口。
+- 只实现了 A06 赛题的「人群密度」一项，出行分析、驻留分析、出行方式分析没有做。
+
+## 构建产物
+
+`mvn package` 生成 `target/voronoi-analysis.jar`（shade 打好的可执行包），可直接 `java -jar` 运行。
